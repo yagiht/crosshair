@@ -14,6 +14,9 @@ cursor always shows where the finger *was*. A prediction model is one way to clo
 
 ## How it works
 
+<img width="1902" height="1458" alt="Adobe Express - Screen Recording 2026-10-30 at 12 14 29 AM" src="https://github.com/user-attachments/assets/4868186a-1620-4f1c-b391-255800c651a4" />
+
+
 ```
 webcam ─► MediaPipe (21 hand points) ─► fingertip track ─► last 8 frames ─► model ─► position 2 frames (~60 ms) ahead
 ```
