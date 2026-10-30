@@ -1,64 +1,99 @@
-# calendar-goog-link
+# Crosshair
 
-## Project Overview
-This project is a static HTML/CSS/JavaScript website designed for GitHub Pages that integrates directly with Google Calendar using the Google Calendar API. Sign-in uses **Google Identity Services (GIS)** — the current, supported OAuth library. (An earlier version of this project used `gapi.auth2`, which Google has deprecated; that's why sign-in never actually worked before.)
+**Predicting hand motion to make webcam hand tracking precise and lag-free.**
 
-## File Structure
+Crosshair is an experiment in predicting where a fingertip will be 60 ms in the future, so a
+hand-tracking cursor feels like it keeps up with your hand instead of trailing behind it.
+
+It's the research side of [FIVES](https://github.com/yagiht/fives), a webcam hand-tracking interface
+that replaces the mouse with gestures. FIVES tracks the hand at ~28 fps with ~21 ms of processing, so the
+cursor always shows where the finger *was*. A prediction model is one way to close that gap.
+
+> Status: **in progress.** The current best model is close to, but not yet better than, a simple
+> constant-velocity baseline. Results below are reported honestly on held-out data.
+
+## How it works
+
 ```
-calendar-goog-link
-├── index.html
-├── style.css
-├── script.js
-└── README.md
-```
-
-## Setup Instructions
-
-### Enabling Google Calendar API
-1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
-2. Create a new project or select an existing project.
-3. Navigate to the "APIs & Services" > "Library" section.
-4. Search for "Google Calendar API" and enable it for your project.
-5. Go to "APIs & Services" > "Credentials".
-6. Click "Create Credentials" and select "OAuth client ID".
-7. Configure the OAuth consent screen if prompted (External is fine for personal use; add your own Google account as a test user if the app stays in "Testing" mode).
-8. Set the application type to "Web application".
-9. Add the following Authorized JavaScript origins:
-   - `https://yagiht.github.io`
-   - `http://localhost:PORT` (optional, for local testing — pick any port you serve the site on)
-10. You do **not** need to set an Authorized redirect URI — Google Identity Services' token flow used here doesn't redirect.
-11. After creating the credentials, copy the `Client ID` (looks like `xxxxx.apps.googleusercontent.com`).
-
-### Adding CLIENT_ID in script.js
-Open `script.js` and set the `CLIENT_ID` constant near the top:
-```javascript
-const CLIENT_ID = 'YOUR_CLIENT_ID_HERE.apps.googleusercontent.com';
+webcam ─► MediaPipe (21 hand points) ─► fingertip track ─► last 8 frames ─► model ─► position 2 frames (~60 ms) ahead
 ```
 
-### Deployment on GitHub Pages
-1. Push your code to a GitHub repository named `calendar-goog-link`.
-2. Go to the repository's Settings > Pages.
-3. Select the branch to deploy (usually `main`).
-4. Save. Your site will be published at `https://yagiht.github.io/calendar-goog-link/`.
-5. Make sure that exact URL's origin (`https://yagiht.github.io`) is listed under Authorized JavaScript origins in step 9 above — a mismatch here is the most common reason sign-in fails.
+1. **Collect data with a game.** `game.py` pops up small "windows" to close by hovering a fingertip
+   over them, a mix of long fast moves and small precise ones. Every game records the raw MediaPipe
+   hand landmarks (positions only, no images) to `data/`, and logs the average close time to
+   `runs/scores.csv` as a usability benchmark.
+2. **Build examples.** Each example is the fingertip's last 8 positions (16 numbers) and the answer is
+   where it actually was 2 frames later. Frames where tracking was lost (NaN) are skipped.
+3. **Train and evaluate** on a time-based split: first 80% of a session for training, last 20% for
+   testing, so the model is always scored on movement it has never seen.
+4. **Compare against baselines** that need no learning:
+   - *no prediction*: "the finger stays where it is" (what a plain cursor does today)
+   - *constant velocity*: "the finger keeps moving at its current speed"
 
-### Testing locally
-Because this uses OAuth, you can't just open `index.html` as a `file://` URL — serve it over http(s), e.g.:
+The game's cursor uses the same pipeline as FIVES: One Euro filtering, a glitch guard against one-frame
+tracking jumps, a PRISM-style precision pointer (slow hand = scaled-down motion, fast hand = 1:1), and
+interpolation between camera frames. Only the on-screen dot is filtered; the recordings stay raw.
+
+## Results so far
+
+One session (~1 minute, 1,776 examples; 1,420 train / 356 test). Error = average distance between the
+predicted and actual fingertip, in screen pixels (1512 px wide), **on the held-out test set**:
+
+| Predictor | Test error |
+|---|---|
+| No prediction | 26.8 px |
+| **Constant velocity (baseline to beat)** | **15.8 px** |
+| Linear model, raw positions | 27.7 px |
+| Linear model, normalized inputs | 17.3 px |
+| MLP (16→64→64→2, ReLU) | 22.9 px |
+
+What I learned:
+- **Normalization mattered most.** Raw positions (~0.5) hide the useful signal, the tiny frame-to-frame
+  movements (~0.02). Making every input relative to the current position and scaling ×10 cut the linear
+  model's error from 27.7 to 17.3 px with no other change.
+- **The bigger model overfit.** The MLP reached a much lower training loss (0.0034 vs 0.027) but did
+  worse on the test set. With one minute of data, it memorized that session.
+- **A low loss can hide a bad model.** On synthetic data, plain SGD reached a tiny loss while the
+  motion weights were only half learned (they get ~10× smaller gradients); Adam fixed it.
+
+**Next:** record 10–15 sessions, filter tracking glitches (teleports > 15% of the frame), retrain, and
+test whether the model beats constant velocity, both in pixels and in real game times (`--model`).
+
+## Run it
+
+Needs Python **3.12** (MediaPipe doesn't support 3.13 yet) and a webcam. Tested on macOS.
+
 ```bash
-python3 -m http.server 8000
+git clone https://github.com/yagiht/crosshair.git
+cd crosshair
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+python game.py                  # play: point at the windows, hover to close (q quits)
+python train.py                 # train on everything in data/
+python game.py --model --seed 1 # play with the trained model steering
+python game.py --seed 1         # same windows without it, to compare
 ```
-then visit `http://localhost:8000`, having added that origin to the OAuth client as described above.
 
-## Functionality
-- Users click "Sign in with Google" to authorize the app for calendar access (via Google Identity Services).
-- Once signed in, "Add To-Do to Calendar" opens a modal to enter a title, urgency, and date/time.
-- Submitting the form creates an event in the user's primary Google Calendar.
-- "Sign out" revokes the current session token.
+`python game.py --help` lists the cursor options (`--raw`, `--no-glide`, `--no-precise`, `--margin`, …).
+On macOS, allow your terminal to use the camera the first time.
 
-## Troubleshooting
-- **Nothing happens when clicking "Add To-Do to Calendar"**: that button is disabled until you're signed in.
-- **Sign-in popup closes immediately / errors**: double-check the Authorized JavaScript origin exactly matches the page's origin (protocol + domain, no trailing path), and that the OAuth consent screen has your Google account added as a test user if it's still in "Testing" status.
-- **Console shows a 403 from the Calendar API**: the Google Calendar API likely isn't enabled on the Cloud project tied to your Client ID.
+## Files
 
-## Acknowledgments
-This project utilizes the Google Calendar API and the gapi JavaScript client library, together with Google Identity Services for authentication.
+| File | What it does |
+|---|---|
+| `game.py` | data-collection game and benchmark |
+| `common.py` | camera, MediaPipe setup, shared settings |
+| `features.py` | turns recordings into training examples |
+| `model.py` | the prediction network |
+| `train.py` | training and evaluation against the baselines |
+| `fake_data.py` | synthetic recordings for testing the pipeline without a camera |
+| `lessons/` | my step-by-step PyTorch learning scripts, from tensors to the experiments above |
+
+## How this was built
+
+I built this while learning PyTorch, with help from Claude (Anthropic's AI). The game and the training
+pipeline (`game.py`, `common.py`, `features.py`, `model.py`, `train.py`) were written with Claude. The
+`lessons/` scripts and the experiments in the results table are my own work, written step by step while
+learning: tensors, training loops, batching, normalization, and diagnosing overfitting.
