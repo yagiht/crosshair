@@ -6,6 +6,7 @@
     python game.py --raw           # no smoothing on the dot (see exactly what MediaPipe sees)
     python game.py --no-precise    # no precision pointer (the dot is always 1:1 with your finger)
     python game.py --margin 0.15   # how much of the picture maps to the window (FIVES CURSOR_MARGIN)
+    python game.py --no-glide      # the dot jumps once per camera frame instead of sliding
 
 How to play: point with your index finger. Little windows pop up; hover the dot
 over one until its ring fills to close it. Small windows test precision, far ones
@@ -14,12 +15,22 @@ average time to runs/scores.csv (the benchmark).
 
 Keys in the game window: q = quit early (still saves).
 
+Each recording (data/session_*.npz) holds:
+  t, pts           camera time and the 21 raw hand points of every frame (NaN = no hand)
+  cursor           where the dot was (camera 0..1, after smoothing / precision), NaN = no hand
+  target_rect      every window as x, y, w, h in game-window pixels
+  target_cam       the same windows in camera units (x0, y0, x1, y1), so they line up with pts
+  target_spawn_t   camera time each window appeared
+  target_close_t   camera time it was closed (NaN = never closed)
+  meta             game settings (window size, margin, dwell, ...) as JSON text
+
 The dot you SEE is smoothed (One Euro filter, like FIVES) and ignores one-frame glitches.
 What gets RECORDED is always the raw MediaPipe points, so your training data stays honest.
 """
 
 import argparse
 import csv
+import json
 import math
 import random
 import time
@@ -169,6 +180,7 @@ def main():
     ap.add_argument("--min-scale", type=float, default=0.35, help="precision: slowest cursor speed (FIVES PRECISE_MIN_SCALE)")
     ap.add_argument("--precise-speed", type=float, default=0.35, help="precision: below this hand speed it slows (FIVES PRECISE_SPEED)")
     ap.add_argument("--margin", type=float, default=0.22, help="edge margin of the picture (FIVES CURSOR_MARGIN)")
+    ap.add_argument("--no-glide", action="store_true", help="no sliding between camera frames")
     args = ap.parse_args()
 
     predictor = None
@@ -190,7 +202,10 @@ def main():
     rng = random.Random(args.seed)
     landmarker = C.make_landmarker()
     cam = C.Camera()
-    times, frames = [], []                      # the recording
+    times, frames, cursors = [], [], []         # the recording (hand points + where the dot was)
+    targets = []                                # every window: rect, when it appeared, when it closed
+    shown = None                                # where the dot was last drawn (window pixels), for gliding
+    GLIDE_STEPS = 3                             # in-between pictures per camera frame
     recent = deque(maxlen=F.HISTORY)            # (t, signal) for the model
     target, last_target = None, None
     spawned = hover_since = None
@@ -253,9 +268,11 @@ def main():
                 if accel is not None:
                     accel.hand_gone()                   # bring your hand back: the dot is under your finger again
 
+            cursors.append(np.array(pointer, np.float32) if pointer is not None else np.full(2, np.nan, np.float32))
             now = time.monotonic()
             if target is None:
                 target, spawned, hover_since = new_target(rng, last_target), now, None
+                targets.append({"rect": target, "spawn_t": stamp, "close_t": float("nan")})
             fill = 0.0
             if pointer is not None:
                 px, py = C.to_window(pointer, W, H)
@@ -265,15 +282,13 @@ def main():
                     fill = (now - hover_since) / DWELL
                     if fill >= 1:
                         close_times.append(now - spawned)
+                        targets[-1]["close_t"] = stamp
                         last_target, target = target, None
                         fill = 0.0
                 else:
                     hover_since = None
             if target is not None:
                 draw_window(canvas, target, fill)
-            if pointer is not None:
-                cv2.circle(canvas, (px, py), 9, BLUE, 2)
-                cv2.circle(canvas, (px, py), 3, WHITE, -1)
 
             fps = 0.9 * fps + 0.1 / max(now - last, 1e-6)
             last = now
@@ -283,8 +298,28 @@ def main():
             cv2.putText(canvas, f"{mode}   closed {len(close_times)}/{args.windows}   avg {avg:.2f}s   "
                         f"{fps:.0f} fps{'' if pointer is not None else '   NO HAND'}",
                         (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, WHITE, 2)
-            cv2.imshow("cursor lab", canvas)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            # Glide (like FIVES): slide the dot to the new spot in a few small steps instead of one jump.
+            # Hovering/closing still uses the real spot, decided above.
+            quit_now = False
+            if pointer is None:
+                shown, steps = None, [None]
+            elif shown is None or args.no_glide:
+                steps = [(px, py)]
+            else:
+                steps = [(int(shown[0] + (px - shown[0]) * k / GLIDE_STEPS),
+                          int(shown[1] + (py - shown[1]) * k / GLIDE_STEPS)) for k in range(1, GLIDE_STEPS + 1)]
+            for i, spot in enumerate(steps):
+                img = canvas.copy() if len(steps) > 1 else canvas
+                if spot is not None:
+                    cv2.circle(img, spot, 9, BLUE, 2)
+                    cv2.circle(img, spot, 3, WHITE, -1)
+                cv2.imshow("cursor lab", img)
+                if cv2.waitKey(1 if i == len(steps) - 1 else 6) & 0xFF == ord("q"):
+                    quit_now = True
+                    break
+            if pointer is not None:
+                shown = (px, py)
+            if quit_now:
                 break
     finally:
         cam.close()
@@ -298,8 +333,21 @@ def main():
     if len(times) > 30:
         C.DATA_DIR.mkdir(exist_ok=True)
         out = C.DATA_DIR / f"session_{stamp_name}_{mode}.npz"
-        np.savez_compressed(out, t=np.array(times), pts=np.array(frames))
-        print(f"Saved {len(times)} frames of hand movement to data/{out.name}")
+        span = 1 - 2 * C.MARGIN                 # window pixels -> camera units (the inverse of C.to_window)
+        to_cam = lambda px, n: C.MARGIN + px / (n - 1) * span
+        rects = np.array([tg["rect"] for tg in targets], np.float32).reshape(-1, 4)
+        cam = np.array([(to_cam(x, W), to_cam(y, H), to_cam(x + w, W), to_cam(y + h, H))
+                        for x, y, w, h in rects], np.float32).reshape(-1, 4)
+        meta = {"window_w": W, "window_h": H, "margin": C.MARGIN, "dwell": DWELL, "precise": accel is not None,
+                "min_scale": args.min_scale, "precise_speed": args.precise_speed, "raw": args.raw,
+                "glide": not args.no_glide, "seed": args.seed, "model": predictor is not None}
+        np.savez_compressed(out, t=np.array(times), pts=np.array(frames), cursor=np.array(cursors),
+                            target_rect=rects, target_cam=cam,
+                            target_spawn_t=np.array([tg["spawn_t"] for tg in targets], np.float64),
+                            target_close_t=np.array([tg["close_t"] for tg in targets], np.float64),
+                            meta=np.array(json.dumps(meta)))
+        closed = int(np.sum(~np.isnan([tg["close_t"] for tg in targets]))) if targets else 0
+        print(f"Saved {len(times)} frames of hand movement and {len(targets)} windows ({closed} closed) to data/{out.name}")
     if close_times:
         avg = float(np.mean(close_times))
         C.RUNS_DIR.mkdir(exist_ok=True)
